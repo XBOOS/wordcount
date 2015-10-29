@@ -100,6 +100,7 @@ bool finished = false;
 void sigint_handler(int signum){
   if(signum==SIGINT){
   finished  = true;
+//  printf("A SIGINT is received\n");
   }else{
   printf("SIGINT something wrong here!!");
   }
@@ -109,10 +110,13 @@ bool has_arrived = false;
 void sigusr1_handler(int signum){
   if(signum==SIGUSR1){
     has_arrived = true;
+//  printf("A SIGUSR1 is received\n");
   }else{
     printf("SIGUSR1 something worng here!!");
   }
 }
+
+
 int main(int argc,char * argv[]){
   if(argc<3){
     printf("Usage: ./wordcnt0 [target plaintext file] [keyword file]\n");
@@ -139,7 +143,7 @@ int main(int argc,char * argv[]){
   int data_pfd[2]; //pipe descriptor
   pipe(task_pfd);
   pipe(data_pfd);
-  int word_count =0;
+  int word_count = 0;
   int numOfChild = std::min(line,10);
 
   pid_t pids[numOfChild]; //child processes with number of line
@@ -150,7 +154,7 @@ int main(int argc,char * argv[]){
       pids[i] = fork();
       
       if(pids[i]>0){//this is the parent process
-        
+ //      printf("Here is the parent process\n"); 
         fscanf(keyFile,"%s",word);
         write(task_pfd[1],word,sizeof(word));
         kill(pids[i],SIGUSR1);
@@ -158,15 +162,18 @@ int main(int argc,char * argv[]){
         continue;
 
       }else if(pids[i]==0){
+       printf("Child %d will start to work\n",getpid());
+
         while(true){
           while(!has_arrived && !finished){
-            sleep(1);
+           sleep(1);
           }
           if(finished){
-            printf("Child (%d) is going to exit\n",(int)getpid());
+//            printf("Child (%d) is going to exit\n",(int)getpid());
             exit(word_count);
           }
 
+          has_arrived = false;
           read(task_pfd[0],word,sizeof(word));
           word_count++;
           result[0].cid = (int)getpid();
@@ -179,8 +186,8 @@ int main(int argc,char * argv[]){
         printf("fork: error no = %s\n",strerror(errno));
         exit(-1);
       }
+  }  
   
-  }
 
   int remaining = line-numOfChild;
   for(i=0;i<line;i++){
@@ -193,7 +200,10 @@ int main(int argc,char * argv[]){
     }
   
   }
+
+
   fclose(keyFile);
+
   int status;
   for (i=0;i<numOfChild;i++){
     kill(pids[i],SIGINT);
