@@ -1,5 +1,5 @@
 /*
-   *Project part1
+   *Project part2
    *Bing Xu
    *UID: 3035027710
  */
@@ -176,6 +176,7 @@ int main(int argc,char * argv[]){
           has_arrived = false;
           read(task_pfd[0],word,sizeof(word));
           word_count++;
+//          printf(".............Here read in another task to search with %d word_count\n",word_count);
           result[0].cid = (int)getpid();
           result[0].count = search(word);
           strcpy(result[0].keyword,word);
@@ -204,14 +205,15 @@ int main(int argc,char * argv[]){
 
   fclose(keyFile);
 
-  int status;
+  int status=0;
   for (i=0;i<numOfChild;i++){
     kill(pids[i],SIGINT);
     waitpid(pids[i],&status,0);
-    printf("Child process (%d) exited and it searched %d words \n",pids[i],status);
+    printf("Child process (%d) exited and it searched %d words \n",pids[i],WEXITSTATUS(status));
   }
   clock_gettime(CLOCK_REALTIME,&end);//record ending time
 
+    printf("\n\n");
   for(i=0;i<line;++i){
     printf("%s : %d\n",result[i].keyword,result[i].count);
   }
