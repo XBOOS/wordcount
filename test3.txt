@@ -1,0 +1,714 @@
+The Linux scheduler is an interesting study in competing pressures. On one side are the use models in which Linux is applied. Although Linux was originally developed as a desktop operating system experiment, you'll now find it on servers, tiny embedded devices, mainframes, and supercomputers. Not surprisingly, the scheduling loads for these domains differ. On the other side are the technological advances made in the platform, including architectures (multiprocessing, symmetric multithreading, non-uniform memory access [NUMA]) and virtualization. Also embedded here is the balance between interactivity (user responsiveness) and overall fairness. From this perspective, it's easy to see how difficult the scheduling problem can be within Linux.
+A short history of Linux schedulers
+Early Linux schedulers used minimal designs, obviously not focused on massive architectures with many processors or even hyperthreading. The 1.2 Linux scheduler used a circular queue for runnable task management that operated with a round-robin scheduling policy. This scheduler was efficient for adding and removing processes (with a lock to protect the structure). In short, the scheduler wasn't complex but was simple and fast.
+Linux version 2.2 introduced the idea of scheduling classes, permitting scheduling policies for real-time tasks, non-preemptible tasks, and non-real-time tasks. The 2.2 scheduler also included support for symmetric multiprocessing (SMP).
+The 2.4 kernel included a relatively simple scheduler that operated in O(N) time (as it iterated over every task during a scheduling event). The 2.4 scheduler divided time into epochs, and within each epoch, every task was allowed to execute up to its time slice. If a task did not use all of its time slice, then half of the remaining time slice was added to the new time slice to allow it to execute longer in the next epoch. The scheduler would simply iterate over the tasks, applying a goodness function (metric) to determine which task to execute next. Although this approach was relatively simple, it was relatively inefficient, lacked scalability, and was weak for real-time systems. It also lacked features to exploit new hardware architectures such as multi-core processors.
+The early 2.6 scheduler, called the O(1) scheduler, was designed to solve many of the problems with the 2.4 scheduler—namely, the scheduler was not required to iterate the entire task list to identify the next task to schedule (resulting in its name, O(1), which meant that it was much more efficient and much more scalable). The O(1) scheduler kept track of runnable tasks in a run queue (actually, two run queues for each priority level—one for active and one for expired tasks), which meant that to identify the task to execute next, the scheduler simply needed to dequeue the next task off the specific active per-priority run queue. The O(1) scheduler was much more scalable and incorporated interactivity metrics with numerous heuristics to determine whether tasks were I/O-bound or processor-bound. But the O(1) scheduler became unwieldy in the kernel. The large mass of code needed to calculate heuristics was fundamentally difficult to manage and, for the purist, lacked algorithmic substance.
+
+Given the issues facing the O(1) scheduler and other external pressures, something needed to change. That change came in the way of a kernel patch from Con Kolivas, with his Rotating Staircase Deadline Scheduler (RSDL), which included his earlier work on the staircase scheduler. The result of this work was a simply designed scheduler that incorporated fairness with bounded latency. Kolivas' scheduler impressed many (with calls to incorporate it into the current 2.6.21 mainline kernel), so it was clear that a scheduler change was on the way. Ingo Molnar, the creator of the O(1) scheduler, then developed the CFS based around some of the ideas from Kolivas' work. Let's dig into the CFS to see how it operates at a high level.
+
+An overview of CFS
+The main idea behind the CFS is to maintain balance (fairness) in providing processor time to tasks. This means processes should be given a fair amount of the processor. When the time for tasks is out of balance (meaning that one or more tasks are not given a fair amount of time relative to others), then those out-of-balance tasks should be given time to execute.
+To determine the balance, the CFS maintains the amount of time provided to a given task in what's called the virtual runtime. The smaller a task's virtual runtime—meaning the smaller amount of time a task has been permitted access to the processor—the higher its need for the processor. The CFS also includes the concept of sleeper fairness to ensure that tasks that are not currently runnable (for example, waiting for I/O) receive a comparable share of the processor when they eventually need it.
+But rather than maintain the tasks in a run queue, as has been done in prior Linux schedulers, the CFS maintains a time-ordered red-black tree (see Figure 1). A red-black tree is a tree with a couple of interesting and useful properties. First, it's self-balancing, which means that no path in the tree will ever be more than twice as long as any other. Second, operations on the tree occur in O(log n) time (where n is the number of nodes in the tree). This means that you can insert or delete a task quickly and efficiently.
+
+With tasks (represented by sched_entity objects) stored in the time-ordered red-black tree, tasks with the gravest need for the processor (lowest virtual runtime) are stored toward the left side of the tree, and tasks with the least need of the processor (highest virtual runtimes) are stored toward the right side of the tree. The scheduler then, to be fair, picks the left-most node of the red-black tree to schedule next to maintain fairness. The task accounts for its time with the CPU by adding its execution time to the virtual runtime and is then inserted back into the tree if runnable. In this way, tasks on the left side of the tree are given time to execute, and the contents of the tree migrate from the right to the left to maintain fairness. Therefore, each runnable task chases the other to maintain a balance of execution across the set of runnable tasks.
+
+All tasks within Linux are represented by a task structure called task_struct. This structure (along with others associated with it) fully describes the task and includes the task's current state, its stack, process flags, priority (both static and dynamic), and much more. You can find this and many of the related structures in ./linux/include/linux/sched.h. But because not all tasks are runnable, you won't find any CFS-related fields in task_struct. Instead, a new structure called sched_entity was created to track scheduling information (see Figure 2).
+
+The relationships of the various structures are shown in Figure 2. The root of the tree is referenced via the rb_root element from the cfs_rq structure (in ./kernel/sched.c). Leaves in a red-black tree contain no information, but internal nodes represent one or more tasks that are runnable. Each node in the red-black tree is represented by an rb_node, which contains nothing more than the child references and the color of the parent. The rb_node is contained within the sched_entity structure, which includes the rb_node reference, load weight, and a variety of statistics data. Most importantly, the sched_entity contains the vruntime (64-bit field), which indicates the amount of time the task has run and serves as the index for the red-black tree. Finally, the task_struct sits at the top, which fully describes the task and includes the sched_entity structure.
+The scheduling function is quite simple when it comes to the CFS portion. In ./kernel/sched.c, you'll find the generic schedule() function, which preempts the currently running task (unless it preempts itself with yield()). Note that CFS has no real notion of time slices for preemption, because the preemption time is variable. The currently running task (now preempted) is returned to the red-black tree through a call to put_prev_task (via the scheduling class). When the schedule function comes to identifying the next task to schedule, it calls the pick_next_task function. This function is also generic (within ./kernel/sched.c), but it calls the CFS scheduler through the scheduler class. The pick_next_task function in CFS can be found in ./kernel/sched_fair.c (called pick_next_task_fair()). This function simply picks the left-most task from the red-black tree and returns the associated sched_entity. With this reference, a simple call to task_of() identifies the task_struct reference returned. The generic scheduler finally provides the processor to this task.
+Priorities and CFS
+CFS doesn't use priorities directly but instead uses them as a decay factor for the time a task is permitted to execute. Lower-priority tasks have higher factors of decay, where higher-priority tasks have lower factors of delay. This means that the time a task is permitted to execute dissipates more quickly for a lower-priority task than for a higher-priority task. That's an elegant solution to avoid maintaining run queues per priority.
+CFS group scheduling
+Another interesting aspect of CFS is the concept of group scheduling (introduced with the 2.6.24 kernel). Group scheduling is another way to bring fairness to scheduling, particularly in the face of tasks that spawn many other tasks. Consider a server that spawns many tasks to parallelize incoming connections (a typical architecture for HTTP servers). Instead of all tasks being treated fairly uniformly, CFS introduces groups to account for this behavior. The server process that spawns tasks share their virtual runtimes across the group (in a hierarchy), while the single task maintains its own independent virtual runtime. In this way, the single task receives roughly the same scheduling time as the group. You'll find a /proc interface to manage the process hierarchies, giving you full control over how groups are formed. Using this configuration, you can assign fairness across users, across processes, or a variation of each.
+
+Scheduling classes and domains
+Also introduced with CFS is the idea of scheduling classes (recall from Figure 2). Each task belongs to a scheduling class, which determines how a task will be scheduled. A scheduling class defines a common set of functions (via sched_class) that define the behavior of the scheduler. For example, each scheduler provides a way to add a task to be scheduled, pull the next task to be run, yield to the scheduler, and so on. Each scheduler class is linked with one another in a singly linked list, allowing the classes to be iterated (for example, for the purposes of enablement of disablement on a given processor). The general structure is shown in Figure 3. Note here that enqueue and dequeue task functions simply add or remove a task from the particular scheduling structures. The function pick_next_task chooses the next task to execute (depending upon the particular policy of the scheduling class).
+
+But recall that the scheduling classes are part of the task structure itself (see Figure 2). This simplifies operations on tasks, regardless of their scheduling class. For example, the following function preempts the currently running task with a new task (where curr defines the currently running task, rq represents the red-black tree for CFS, and p is the next task to schedule) from ./kernel/sched.c:
+static inline void check_preempt( struct rq *rq, struct task_struct *p )
+{
+  rq->curr->sched_class->check_preempt_curr( rq, p );
+}
+
+If this task were using the fair scheduling class, check_preempt_curr() would resolve to check_preempt_wakeup(). You can see these relationships in ./kernel/sched_rt.c, ./kernel/sched_fair.c and ./kernel/sched_idle.c.
+Scheduling classes are yet another interesting aspect of the scheduling changes, but the functionality grows with the addition of scheduling domains. These domains allow you to group one or more processors hierarchically for purposes load balancing and segregation. One or more processors can share scheduling policies (and load balance between them) or implement independent scheduling policies to intentionally segregate tasks.
+
+Other schedulers
+Work on scheduling continues, and you'll find schedulers under development that push the boundaries of performance and scaling. Con Kolivas was not deterred by his Linux experience and has developed another scheduler for Linux with a provocative acronym: BFS. The scheduler was reported to have better performance on NUMA systems as well as mobile devices and was introduced into a derivative of the Android operating system.
+
+Going further
+If there's one constant with Linux, it's that change is inevitable. Today, the CFS is the 2.6 Linux scheduler; but tomorrow, it could be another new scheduler or a suite of schedulers that can be statically or dynamically invoked. There's also a certain amount of mystery in the process behind the CFS, RSDL, and kernel inclusion, but thanks to both Kolivas' and Molnar's work, we have a new level of fairness in 2.6 task scheduling.
+
+Most modern operating systems are designed to try to extract optimal performance from underlying hardware resources. This is achieved mainly by virtualization of the two main hardware resources: CPU and memory. Modern operating systems provide a multitasking environment that essentially gives each task its own virtual CPU. The task generally is unaware of the fact that it does not have exclusive use of the CPU.
+
+Similarly, memory virtualization is achieved by giving each task its own virtual memory address space, which is then mapped onto the real memory of the system. Again, the task generally is unaware of the fact that its virtual memory addresses may not map to the same physical address in real memory.
+
+CPU virtualization is achieved by “sharing” the CPU between multiple tasks—that is, each running task gets a small fraction of the CPU at regular intervals. The algorithm used to select one task at a time from the multiple available runnable tasks is called the scheduler, and the process of selecting the next task is called scheduling.
+
+The scheduler is one of the most important components of any OS. Implementing a scheduling algorithm is difficult for a couple reasons. First, an acceptable algorithm has to allocate CPU time such that higher-priority tasks (for example, interactive applications like a Web browser) are given preference over low-priority tasks (for example, non-interactive batch processes like program compilation). At the same time, the scheduler must protect against low-priority process starvation. In other words, low-priority processes must be allowed to run eventually, regardless of how many high-priority processes are vying for CPU time. Schedulers also must be crafted carefully, so that processes appear to be running simultaneously without having too large an impact on system throughput.
+
+For interactive processes like GUIs, the ideal scheduler would give each process a very small amount of time on the CPU and rapidly cycle between processes. Because users expect interactive processes to respond to input immediately, the delay between user input and process execution ideally should be imperceptible to humans—somewhere between 50 and 150ms at most.
+
+For non-interactive processes, the situation is reversed. Switching between processes, or context switching, is a relatively expensive operation. Thus, larger slices of time on the processor and fewer context switches can improve system performance and throughput. The scheduling algorithm must strike a balance between all of these competing needs.
+
+Like most modern operating systems, Linux is a multitasking operating system, and therefore, it has a scheduler. The Linux scheduler has evolved over time.
+
+O(1) Scheduler
+The Linux scheduler was overhauled completely with the release of kernel 2.6. This new scheduler is called the O(1) scheduler—O(...) is referred to as “big O notation”. The name was chosen because the scheduler's algorithm required constant time to make a scheduling decision, regardless of the number of tasks. The algorithm used by the O(1) scheduler relies on active and expired arrays of processes to achieve constant scheduling time. Each process is given a fixed time quantum, after which it is preempted and moved to the expired array. Once all the tasks from the active array have exhausted their time quantum and have been moved to the expired array, an array switch takes place. This switch makes the active array the new empty expired array, while the expired array becomes the active array.
+
+The main issue with this algorithm is the complex heuristics used to mark a task as interactive or non-interactive. The algorithm tries to identify interactive processes by analyzing average sleep time (the amount of time the process spends waiting for input). Processes that sleep for long periods of time probably are waiting for user input, so the scheduler assumes they're interactive. The scheduler gives a priority bonus to interactive tasks (for better throughput) while penalizing non-interactive tasks by lowering their priorities. All the calculations to determine the interactivity of tasks are complex and subject to potential miscalculations, causing non-interactive behavior from an interactive process.
+
+As I explain later in this article, CFS is free from any such calculations and just tries to be “fair” to every task running in the system.
+
+Completely Fair Scheduler
+According to Ingo Molnar, the author of the CFS, its core design can be summed up in single sentence: “CFS basically models an 'ideal, precise multitasking CPU' on real hardware.”
+
+Let's try to understand what “ideal, precise, multitasking CPU” means, as the CFS tries to emulate this CPU. An “ideal, precise, multitasking CPU” is a hardware CPU that can run multiple processes at the same time (in parallel), giving each process an equal share of processor power (not time, but power). If a single process is running, it would receive 100% of the processor's power. With two processes, each would have exactly 50% of the physical power (in parallel). Similarly, with four processes running, each would get precisely 25% of physical CPU power in parallel and so on. Therefore, this CPU would be “fair” to all the tasks running in the system (Figure 1).
+
+Obviously, this ideal CPU is nonexistent, but the CFS tries to emulate such a processor in software. On an actual real-world processor, only one task can be allocated to a CPU at a particular time. Therefore, all other tasks wait during this period. So, while the currently running task gets 100% of the CPU power, all other tasks get 0% of the CPU power. This is obviously not fair (Figure 2).
+
+The CFS tries to eliminate this unfairness from the system. The CFS tries to keep track of the fair share of the CPU that would have been available to each process in the system. So, CFS runs a fair clock at a fraction of real CPU clock speed. The fair clock's rate of increase is calculated by dividing the wall time (in nanoseconds) by the total number of processes waiting. The resulting value is the amount of CPU time to which each process is entitled.
+
+As a process waits for the CPU, the scheduler tracks the amount of time it would have used on the ideal processor. This wait time, represented by the per-task wait_runtime variable, is used to rank processes for scheduling and to determine the amount of time the process is allowed to execute before being preempted. The process with the longest wait time (that is, with the gravest need of CPU) is picked by the scheduler and assigned to the CPU. When this process is running, its wait time decreases, while the time of other waiting tasks increases (as they were waiting). This essentially means that after some time, there will be another task with the largest wait time (in gravest need of the CPU), and the currently running task will be preempted. Using this principle, CFS tries to be fair to all tasks and always tries to have a system with zero wait time for each process—each process has an equal share of the CPU (something an “ideal, precise, multitasking CPU” would have done).
+
+Kernel 2.6.23
+In order for the CFS to emulate an “ideal, precise, multitasking CPU” by giving each runnable process an equal slice of execution time, CFS needs to have the following:
+
+A mechanism to calculate what the fair CPU share is per process. This is achieved by using a system-wide runqueue fair_clock variable (cfs_rq->fair_clock). This fair clock runs at a fraction of real time, so that it runs at the ideal pace for a single task when there are N runnable tasks in the system. For example, if you have four runnable tasks, fair_clock increases at one-fourth of the speed of wall time (which means 25% fair CPU power).
+
+A mechanism to keep track of the time for which each process was waiting while the CPU was assigned to the currently running task. This wait time is accumulated in the per-process variable wait_runtime (process->wait_runtime).
+
+Red-Black Tree (RBTree)
+
+A red-black tree is a type of self-balancing binary search tree—a data structure typically used to implement associative arrays. It is complex, but it has good worst-case running time for its operations and is efficient in practice. It can search, insert and delete in O(log n) time, where n is the number of elements in the tree. In red-black trees, the leaf nodes are not relevant and do not contain data. These leaves need not be explicit in computer memory—a null child pointer can encode the fact that this child is a leaf—but it simplifies some algorithms for operating on red-black trees if the leaves really are explicit nodes. To save memory, sometimes a single sentinel node performs the role of all leaf nodes; all references from internal nodes to leaf nodes then point to the sentinel node. (Source: Wikipedia.)
+
+CFS uses the fair clock and wait runtime to keep all the runnable tasks sorted by the rq->fair_clock - p->wait_runtime key in the rbtree (see the Red-Black Tree sidebar). So, the leftmost task in the tree is the one with the “gravest CPU need”, and CFS picks the leftmost task and sticks to it. As the system progresses forward, newly awakened tasks are put into the tree farther and farther to the right—slowly but surely giving every task a chance to become the leftmost task and, thus, get on the CPU within a deterministic amount of time.
+
+Because of this simple design, CFS no longer uses active and expired arrays and dispensed with sophisticated heuristics to mark tasks as interactive versus non-interactive.
+
+CFS implements priorities by using weighted tasks—each task is assigned a weight based on its static priority. So, while running, the task with lower weight (lower-priority) will see time elapse at a faster rate than that of a higher-priority task. This means its wait_runtime will exhaust more quickly than that of a higher-priority task, so lower-priority tasks will get less CPU time compared to higher-priority tasks.
+
+Kernel 2.6.24
+CFS has been modified a bit further in 2.6.24. Although the basic concept of fairness remains, a few implementation details have changed. Now, instead of chasing the global fair clock (rq->fair_clock), tasks chase each other. A clock per task, vruntime, is introduced, and an approximated average is used to initialize this clock for new tasks. Each task tracks its runtime and is queued in the RBTree using this parameter. So, the task that has run least (the one that has the gravest CPU need) is the leftmost node of the RBTree and will be picked up by the scheduler. See Resources for more details about this implementation.
+
+In kernel 2.6.24, another major addition to CFS is group scheduling. Plain CFS tries to be fair to all the tasks running in the system. For example, let's say there is a total of 25 runnable processes in the system. CFS tries to be fair by allocating 4% of the CPU to all of them. However, let's say that out of these 25 processes, 20 belong to user A while 5 belong to user B. User B is at an inherent disadvantage, as A is getting more CPU power than B. Group scheduling tries to eliminate this problem. It first tries to be fair to a group and then to individual tasks within that group. So CFS, with group scheduling enabled, will allocate 50% of the CPU to each user A and B. The allocated 50% share of A will be divided fairly among A's 20 tasks, while the other 50% of the CPU time will be distributed fairly among B's 5 tasks.
+
+Scheduling Classes/Modular Scheduler
+With kernel 2.6.23, the Linux scheduler also has been made modular. Each scheduling policy (SCHED_FIFO, SCHED_RR, SCHED_OTHER and so on) can be implemented independently of the base scheduler code. This modularization is similar to object-oriented class hierarchies (Figure 3).
+
+The core scheduler does not need to be aware of the implementation details of the individual scheduling policies. In kernel 2.6.23, sched.c (the “scheduler” from older kernels) is divided into the following files to make the scheduler modular:
+
+kernel/sched.c: contains the code of a generic scheduler, thereby exposing functions like sched(). The specific scheduling policy is implemented in a different file.
+
+kernel/sched_fair.c: this is the main file that implements the CFS scheduler and provides the SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE scheduling policies.
+
+kernel/sched_rt.c: provides the SCHED_RR and SCHED_FIFO policies used by real-time (RT) threads.
+
+Each of these scheduling policies (fair and RT) registers its function pointers with the core scheduler. The core scheduler calls the appropriate scheduler (fair or RT), based on the scheduling policy of the particular process. As with the O(1) scheduler, real-time processes will have higher priority than normal processes. CFS mainly addresses non-real-time processes, and the RT scheduler remains more or less the same as before (except for a few changes as to how non-active/expired arrays are maintained).
+
+With this new modular scheduler in place, people who want to write new schedulers for a particular policy can do so by simply registering these new policy functions with the core scheduler.
+
+Summary
+The CFS design is quite radical and innovative in its approach. Features like the modular scheduler ease the task of integrating new scheduler types to the core scheduler.
+
+The new Linux scheduler extends scheduling capabilities by introducing scheduling classes and also simplifies debugging by improving schedule statistics. Completely Fair Scheduler (CFS) is getting good reviews when tested for thread-intensive applications including 3D games. CFS handles CPU resource allocation for executing processes, and aims to maximize overall CPU utilization while maximizing interactive performance. CFS considered as the first implementation of a fair queuing process scheduler in a widely used general-purpose operating system.
+
+The Linux 2.6.23 kernel comes with a modular scheduler core and a CFS, which is implemented as a scheduling module. In this article, get acquainted with the major features of the CFS, see how it works, and look ahead to some of the expected changes for the 2.6.24 release.
+
+
+This is the CFS scheduler.
+
+80% of CFS's design can be summed up in a single sentence: CFS basically
+models an "ideal, precise multi-tasking CPU" on real hardware.
+
+"Ideal multi-tasking CPU" is a (non-existent  :-))  CPU that has 100%
+physical power and which can run each task at precise equal speed, in
+parallel, each at 1/nr_running speed. For example: if there are 2 tasks
+running then it runs each at 50% physical power - totally in parallel.
+
+On real hardware, we can run only a single task at once, so while that
+one task runs, the other tasks that are waiting for the CPU are at a
+disadvantage - the current task gets an unfair amount of CPU time. In
+CFS this fairness imbalance is expressed and tracked via the per-task
+p->wait_runtime (nanosec-unit) value. "wait_runtime" is the amount of
+time the task should now run on the CPU for it to become completely fair
+and balanced.
+
+( small detail: on 'ideal' hardware, the p->wait_runtime value would
+  always be zero - no task would ever get 'out of balance' from the
+  'ideal' share of CPU time. )
+
+CFS's task picking logic is based on this p->wait_runtime value and it
+is thus very simple: it always tries to run the task with the largest
+p->wait_runtime value. In other words, CFS tries to run the task with
+the 'gravest need' for more CPU time. So CFS always tries to split up
+CPU time between runnable tasks as close to 'ideal multitasking
+hardware' as possible.
+
+Most of the rest of CFS's design just falls out of this really simple
+concept, with a few add-on embellishments like nice levels,
+multiprocessing and various algorithm variants to recognize sleepers.
+
+In practice it works like this: the system runs a task a bit, and when
+the task schedules (or a scheduler tick happens) the task's CPU usage is
+'accounted for': the (small) time it just spent using the physical CPU
+is deducted from p->wait_runtime. [minus the 'fair share' it would have
+gotten anyway]. Once p->wait_runtime gets low enough so that another
+task becomes the 'leftmost task' of the time-ordered rbtree it maintains
+(plus a small amount of 'granularity' distance relative to the leftmost
+task so that we do not over-schedule tasks and trash the cache) then the
+new leftmost task is picked and the current task is preempted.
+
+The rq->fair_clock value tracks the 'CPU time a runnable task would have
+fairly gotten, had it been runnable during that time'. So by using
+rq->fair_clock values we can accurately timestamp and measure the
+'expected CPU time' a task should have gotten. All runnable tasks are
+sorted in the rbtree by the "rq->fair_clock - p->wait_runtime" key, and
+CFS picks the 'leftmost' task and sticks to it. As the system progresses
+forwards, newly woken tasks are put into the tree more and more to the
+right - slowly but surely giving a chance for every task to become the
+'leftmost task' and thus get on the CPU within a deterministic amount of
+time.
+
+Some implementation details:
+
+ - the introduction of Scheduling Classes: an extensible hierarchy of
+   scheduler modules. These modules encapsulate scheduling policy
+   details and are handled by the scheduler core without the core
+   code assuming about them too much.
+
+ - sched_fair.c implements the 'CFS desktop scheduler': it is a
+   replacement for the vanilla scheduler's SCHED_OTHER interactivity
+   code.
+
+   I'd like to give credit to Con Kolivas for the general approach here:
+   he has proven via RSDL/SD that 'fair scheduling' is possible and that
+   it results in better desktop scheduling. Kudos Con!
+
+   The CFS patch uses a completely different approach and implementation
+   from RSDL/SD. My goal was to make CFS's interactivity quality exceed
+   that of RSDL/SD, which is a high standard to meet :-) Testing
+   feedback is welcome to decide this one way or another. [ and, in any
+   case, all of SD's logic could be added via a kernel/sched_sd.c module
+   as well, if Con is interested in such an approach. ]
+
+   CFS's design is quite radical: it does not use runqueues, it uses a
+   time-ordered rbtree to build a 'timeline' of future task execution,
+   and thus has no 'array switch' artifacts (by which both the vanilla
+   scheduler and RSDL/SD are affected).
+
+   CFS uses nanosecond granularity accounting and does not rely on any
+   jiffies or other HZ detail. Thus the CFS scheduler has no notion of
+   'timeslices' and has no heuristics whatsoever. There is only one
+   central tunable:
+
+         /proc/sys/kernel/sched_granularity_ns
+
+   which can be used to tune the scheduler from 'desktop' (low
+   latencies) to 'server' (good batching) workloads. It defaults to a
+   setting suitable for desktop workloads. SCHED_BATCH is handled by the
+   CFS scheduler module too.
+
+   Due to its design, the CFS scheduler is not prone to any of the
+   'attacks' that exist today against the heuristics of the stock
+   scheduler: fiftyp.c, thud.c, chew.c, ring-test.c, massive_intr.c all
+   work fine and do not impact interactivity and produce the expected
+   behavior.
+
+   the CFS scheduler has a much stronger handling of nice levels and
+   SCHED_BATCH: both types of workloads should be isolated much more
+   agressively than under the vanilla scheduler.
+
+   ( another detail: due to nanosec accounting and timeline sorting,
+     sched_yield() support is very simple under CFS, and in fact under
+     CFS sched_yield() behaves much better than under any other
+     scheduler i have tested so far. )
+
+ - sched_rt.c implements SCHED_FIFO and SCHED_RR semantics, in a simpler
+   way than the vanilla scheduler does. It uses 100 runqueues (for all
+   100 RT priority levels, instead of 140 in the vanilla scheduler)
+   and it needs no expired array.
+
+ - reworked/sanitized SMP load-balancing: the runqueue-walking
+   assumptions are gone from the load-balancing code now, and
+   iterators of the scheduling modules are used. The balancing code got
+   quite a bit simpler as a result.
+
+
+This is the CFS scheduler.
+
+80% of CFS's design can be summed up in a single sentence: CFS basically
+models an "ideal, precise multi-tasking CPU" on real hardware.
+
+"Ideal multi-tasking CPU" is a (non-existent  :-))  CPU that has 100%
+physical power and which can run each task at precise equal speed, in
+parallel, each at 1/nr_running speed. For example: if there are 2 tasks
+running then it runs each at 50% physical power - totally in parallel.
+
+On real hardware, we can run only a single task at once, so while that
+one task runs, the other tasks that are waiting for the CPU are at a
+disadvantage - the current task gets an unfair amount of CPU time. In
+CFS this fairness imbalance is expressed and tracked via the per-task
+p->wait_runtime (nanosec-unit) value. "wait_runtime" is the amount of
+time the task should now run on the CPU for it to become completely fair
+and balanced.
+
+( small detail: on 'ideal' hardware, the p->wait_runtime value would
+  always be zero - no task would ever get 'out of balance' from the
+  'ideal' share of CPU time. )
+
+CFS's task picking logic is based on this p->wait_runtime value and it
+is thus very simple: it always tries to run the task with the largest
+p->wait_runtime value. In other words, CFS tries to run the task with
+the 'gravest need' for more CPU time. So CFS always tries to split up
+CPU time between runnable tasks as close to 'ideal multitasking
+hardware' as possible.
+
+Most of the rest of CFS's design just falls out of this really simple
+concept, with a few add-on embellishments like nice levels,
+multiprocessing and various algorithm variants to recognize sleepers.
+
+In practice it works like this: the system runs a task a bit, and when
+the task schedules (or a scheduler tick happens) the task's CPU usage is
+'accounted for': the (small) time it just spent using the physical CPU
+is deducted from p->wait_runtime. [minus the 'fair share' it would have
+gotten anyway]. Once p->wait_runtime gets low enough so that another
+task becomes the 'leftmost task' of the time-ordered rbtree it maintains
+(plus a small amount of 'granularity' distance relative to the leftmost
+task so that we do not over-schedule tasks and trash the cache) then the
+new leftmost task is picked and the current task is preempted.
+
+The rq->fair_clock value tracks the 'CPU time a runnable task would have
+fairly gotten, had it been runnable during that time'. So by using
+rq->fair_clock values we can accurately timestamp and measure the
+'expected CPU time' a task should have gotten. All runnable tasks are
+sorted in the rbtree by the "rq->fair_clock - p->wait_runtime" key, and
+CFS picks the 'leftmost' task and sticks to it. As the system progresses
+forwards, newly woken tasks are put into the tree more and more to the
+right - slowly but surely giving a chance for every task to become the
+'leftmost task' and thus get on the CPU within a deterministic amount of
+time.
+
+Some implementation details:
+
+ - the introduction of Scheduling Classes: an extensible hierarchy of
+   scheduler modules. These modules encapsulate scheduling policy
+   details and are handled by the scheduler core without the core
+   code assuming about them too much.
+
+ - sched_fair.c implements the 'CFS desktop scheduler': it is a
+   replacement for the vanilla scheduler's SCHED_OTHER interactivity
+   code.
+
+   I'd like to give credit to Con Kolivas for the general approach here:
+   he has proven via RSDL/SD that 'fair scheduling' is possible and that
+   it results in better desktop scheduling. Kudos Con!
+
+   The CFS patch uses a completely different approach and implementation
+   from RSDL/SD. My goal was to make CFS's interactivity quality exceed
+   that of RSDL/SD, which is a high standard to meet :-) Testing
+   feedback is welcome to decide this one way or another. [ and, in any
+   case, all of SD's logic could be added via a kernel/sched_sd.c module
+   as well, if Con is interested in such an approach. ]
+
+   CFS's design is quite radical: it does not use runqueues, it uses a
+   time-ordered rbtree to build a 'timeline' of future task execution,
+   and thus has no 'array switch' artifacts (by which both the vanilla
+   scheduler and RSDL/SD are affected).
+
+   CFS uses nanosecond granularity accounting and does not rely on any
+   jiffies or other HZ detail. Thus the CFS scheduler has no notion of
+   'timeslices' and has no heuristics whatsoever. There is only one
+   central tunable:
+
+         /proc/sys/kernel/sched_granularity_ns
+
+   which can be used to tune the scheduler from 'desktop' (low
+   latencies) to 'server' (good batching) workloads. It defaults to a
+   setting suitable for desktop workloads. SCHED_BATCH is handled by the
+   CFS scheduler module too.
+
+   Due to its design, the CFS scheduler is not prone to any of the
+   'attacks' that exist today against the heuristics of the stock
+   scheduler: fiftyp.c, thud.c, chew.c, ring-test.c, massive_intr.c all
+   work fine and do not impact interactivity and produce the expected
+   behavior.
+
+   the CFS scheduler has a much stronger handling of nice levels and
+   SCHED_BATCH: both types of workloads should be isolated much more
+   agressively than under the vanilla scheduler.
+
+   ( another detail: due to nanosec accounting and timeline sorting,
+     sched_yield() support is very simple under CFS, and in fact under
+     CFS sched_yield() behaves much better than under any other
+     scheduler i have tested so far. )
+
+ - sched_rt.c implements SCHED_FIFO and SCHED_RR semantics, in a simpler
+   way than the vanilla scheduler does. It uses 100 runqueues (for all
+   100 RT priority levels, instead of 140 in the vanilla scheduler)
+   and it needs no expired array.
+
+ - reworked/sanitized SMP load-balancing: the runqueue-walking
+   assumptions are gone from the load-balancing code now, and
+   iterators of the scheduling modules are used. The balancing code got
+   quite a bit simpler as a result.
+
+The Linux scheduler is an interesting study in competing pressures. On one side are the use models in which Linux is applied. Although Linux was originally developed as a desktop operating system experiment, you'll now find it on servers, tiny embedded devices, mainframes, and supercomputers. Not surprisingly, the scheduling loads for these domains differ. On the other side are the technological advances made in the platform, including architectures (multiprocessing, symmetric multithreading, non-uniform memory access [NUMA]) and virtualization. Also embedded here is the balance between interactivity (user responsiveness) and overall fairness. From this perspective, it's easy to see how difficult the scheduling problem can be within Linux.
+A short history of Linux schedulers
+Early Linux schedulers used minimal designs, obviously not focused on massive architectures with many processors or even hyperthreading. The 1.2 Linux scheduler used a circular queue for runnable task management that operated with a round-robin scheduling policy. This scheduler was efficient for adding and removing processes (with a lock to protect the structure). In short, the scheduler wasn't complex but was simple and fast.
+Linux version 2.2 introduced the idea of scheduling classes, permitting scheduling policies for real-time tasks, non-preemptible tasks, and non-real-time tasks. The 2.2 scheduler also included support for symmetric multiprocessing (SMP).
+The 2.4 kernel included a relatively simple scheduler that operated in O(N) time (as it iterated over every task during a scheduling event). The 2.4 scheduler divided time into epochs, and within each epoch, every task was allowed to execute up to its time slice. If a task did not use all of its time slice, then half of the remaining time slice was added to the new time slice to allow it to execute longer in the next epoch. The scheduler would simply iterate over the tasks, applying a goodness function (metric) to determine which task to execute next. Although this approach was relatively simple, it was relatively inefficient, lacked scalability, and was weak for real-time systems. It also lacked features to exploit new hardware architectures such as multi-core processors.
+The early 2.6 scheduler, called the O(1) scheduler, was designed to solve many of the problems with the 2.4 scheduler—namely, the scheduler was not required to iterate the entire task list to identify the next task to schedule (resulting in its name, O(1), which meant that it was much more efficient and much more scalable). The O(1) scheduler kept track of runnable tasks in a run queue (actually, two run queues for each priority level—one for active and one for expired tasks), which meant that to identify the task to execute next, the scheduler simply needed to dequeue the next task off the specific active per-priority run queue. The O(1) scheduler was much more scalable and incorporated interactivity metrics with numerous heuristics to determine whether tasks were I/O-bound or processor-bound. But the O(1) scheduler became unwieldy in the kernel. The large mass of code needed to calculate heuristics was fundamentally difficult to manage and, for the purist, lacked algorithmic substance.
+
+Given the issues facing the O(1) scheduler and other external pressures, something needed to change. That change came in the way of a kernel patch from Con Kolivas, with his Rotating Staircase Deadline Scheduler (RSDL), which included his earlier work on the staircase scheduler. The result of this work was a simply designed scheduler that incorporated fairness with bounded latency. Kolivas' scheduler impressed many (with calls to incorporate it into the current 2.6.21 mainline kernel), so it was clear that a scheduler change was on the way. Ingo Molnar, the creator of the O(1) scheduler, then developed the CFS based around some of the ideas from Kolivas' work. Let's dig into the CFS to see how it operates at a high level.
+
+An overview of CFS
+The main idea behind the CFS is to maintain balance (fairness) in providing processor time to tasks. This means processes should be given a fair amount of the processor. When the time for tasks is out of balance (meaning that one or more tasks are not given a fair amount of time relative to others), then those out-of-balance tasks should be given time to execute.
+To determine the balance, the CFS maintains the amount of time provided to a given task in what's called the virtual runtime. The smaller a task's virtual runtime—meaning the smaller amount of time a task has been permitted access to the processor—the higher its need for the processor. The CFS also includes the concept of sleeper fairness to ensure that tasks that are not currently runnable (for example, waiting for I/O) receive a comparable share of the processor when they eventually need it.
+But rather than maintain the tasks in a run queue, as has been done in prior Linux schedulers, the CFS maintains a time-ordered red-black tree (see Figure 1). A red-black tree is a tree with a couple of interesting and useful properties. First, it's self-balancing, which means that no path in the tree will ever be more than twice as long as any other. Second, operations on the tree occur in O(log n) time (where n is the number of nodes in the tree). This means that you can insert or delete a task quickly and efficiently.
+
+With tasks (represented by sched_entity objects) stored in the time-ordered red-black tree, tasks with the gravest need for the processor (lowest virtual runtime) are stored toward the left side of the tree, and tasks with the least need of the processor (highest virtual runtimes) are stored toward the right side of the tree. The scheduler then, to be fair, picks the left-most node of the red-black tree to schedule next to maintain fairness. The task accounts for its time with the CPU by adding its execution time to the virtual runtime and is then inserted back into the tree if runnable. In this way, tasks on the left side of the tree are given time to execute, and the contents of the tree migrate from the right to the left to maintain fairness. Therefore, each runnable task chases the other to maintain a balance of execution across the set of runnable tasks.
+
+All tasks within Linux are represented by a task structure called task_struct. This structure (along with others associated with it) fully describes the task and includes the task's current state, its stack, process flags, priority (both static and dynamic), and much more. You can find this and many of the related structures in ./linux/include/linux/sched.h. But because not all tasks are runnable, you won't find any CFS-related fields in task_struct. Instead, a new structure called sched_entity was created to track scheduling information (see Figure 2).
+
+The relationships of the various structures are shown in Figure 2. The root of the tree is referenced via the rb_root element from the cfs_rq structure (in ./kernel/sched.c). Leaves in a red-black tree contain no information, but internal nodes represent one or more tasks that are runnable. Each node in the red-black tree is represented by an rb_node, which contains nothing more than the child references and the color of the parent. The rb_node is contained within the sched_entity structure, which includes the rb_node reference, load weight, and a variety of statistics data. Most importantly, the sched_entity contains the vruntime (64-bit field), which indicates the amount of time the task has run and serves as the index for the red-black tree. Finally, the task_struct sits at the top, which fully describes the task and includes the sched_entity structure.
+The scheduling function is quite simple when it comes to the CFS portion. In ./kernel/sched.c, you'll find the generic schedule() function, which preempts the currently running task (unless it preempts itself with yield()). Note that CFS has no real notion of time slices for preemption, because the preemption time is variable. The currently running task (now preempted) is returned to the red-black tree through a call to put_prev_task (via the scheduling class). When the schedule function comes to identifying the next task to schedule, it calls the pick_next_task function. This function is also generic (within ./kernel/sched.c), but it calls the CFS scheduler through the scheduler class. The pick_next_task function in CFS can be found in ./kernel/sched_fair.c (called pick_next_task_fair()). This function simply picks the left-most task from the red-black tree and returns the associated sched_entity. With this reference, a simple call to task_of() identifies the task_struct reference returned. The generic scheduler finally provides the processor to this task.
+Priorities and CFS
+CFS doesn't use priorities directly but instead uses them as a decay factor for the time a task is permitted to execute. Lower-priority tasks have higher factors of decay, where higher-priority tasks have lower factors of delay. This means that the time a task is permitted to execute dissipates more quickly for a lower-priority task than for a higher-priority task. That's an elegant solution to avoid maintaining run queues per priority.
+CFS group scheduling
+Another interesting aspect of CFS is the concept of group scheduling (introduced with the 2.6.24 kernel). Group scheduling is another way to bring fairness to scheduling, particularly in the face of tasks that spawn many other tasks. Consider a server that spawns many tasks to parallelize incoming connections (a typical architecture for HTTP servers). Instead of all tasks being treated fairly uniformly, CFS introduces groups to account for this behavior. The server process that spawns tasks share their virtual runtimes across the group (in a hierarchy), while the single task maintains its own independent virtual runtime. In this way, the single task receives roughly the same scheduling time as the group. You'll find a /proc interface to manage the process hierarchies, giving you full control over how groups are formed. Using this configuration, you can assign fairness across users, across processes, or a variation of each.
+
+Scheduling classes and domains
+Also introduced with CFS is the idea of scheduling classes (recall from Figure 2). Each task belongs to a scheduling class, which determines how a task will be scheduled. A scheduling class defines a common set of functions (via sched_class) that define the behavior of the scheduler. For example, each scheduler provides a way to add a task to be scheduled, pull the next task to be run, yield to the scheduler, and so on. Each scheduler class is linked with one another in a singly linked list, allowing the classes to be iterated (for example, for the purposes of enablement of disablement on a given processor). The general structure is shown in Figure 3. Note here that enqueue and dequeue task functions simply add or remove a task from the particular scheduling structures. The function pick_next_task chooses the next task to execute (depending upon the particular policy of the scheduling class).
+
+But recall that the scheduling classes are part of the task structure itself (see Figure 2). This simplifies operations on tasks, regardless of their scheduling class. For example, the following function preempts the currently running task with a new task (where curr defines the currently running task, rq represents the red-black tree for CFS, and p is the next task to schedule) from ./kernel/sched.c:
+static inline void check_preempt( struct rq *rq, struct task_struct *p )
+{
+  rq->curr->sched_class->check_preempt_curr( rq, p );
+}
+
+If this task were using the fair scheduling class, check_preempt_curr() would resolve to check_preempt_wakeup(). You can see these relationships in ./kernel/sched_rt.c, ./kernel/sched_fair.c and ./kernel/sched_idle.c.
+Scheduling classes are yet another interesting aspect of the scheduling changes, but the functionality grows with the addition of scheduling domains. These domains allow you to group one or more processors hierarchically for purposes load balancing and segregation. One or more processors can share scheduling policies (and load balance between them) or implement independent scheduling policies to intentionally segregate tasks.
+
+Other schedulers
+Work on scheduling continues, and you'll find schedulers under development that push the boundaries of performance and scaling. Con Kolivas was not deterred by his Linux experience and has developed another scheduler for Linux with a provocative acronym: BFS. The scheduler was reported to have better performance on NUMA systems as well as mobile devices and was introduced into a derivative of the Android operating system.
+
+Going further
+If there's one constant with Linux, it's that change is inevitable. Today, the CFS is the 2.6 Linux scheduler; but tomorrow, it could be another new scheduler or a suite of schedulers that can be statically or dynamically invoked. There's also a certain amount of mystery in the process behind the CFS, RSDL, and kernel inclusion, but thanks to both Kolivas' and Molnar's work, we have a new level of fairness in 2.6 task scheduling.
+
+Most modern operating systems are designed to try to extract optimal performance from underlying hardware resources. This is achieved mainly by virtualization of the two main hardware resources: CPU and memory. Modern operating systems provide a multitasking environment that essentially gives each task its own virtual CPU. The task generally is unaware of the fact that it does not have exclusive use of the CPU.
+
+Similarly, memory virtualization is achieved by giving each task its own virtual memory address space, which is then mapped onto the real memory of the system. Again, the task generally is unaware of the fact that its virtual memory addresses may not map to the same physical address in real memory.
+
+CPU virtualization is achieved by “sharing” the CPU between multiple tasks—that is, each running task gets a small fraction of the CPU at regular intervals. The algorithm used to select one task at a time from the multiple available runnable tasks is called the scheduler, and the process of selecting the next task is called scheduling.
+
+The scheduler is one of the most important components of any OS. Implementing a scheduling algorithm is difficult for a couple reasons. First, an acceptable algorithm has to allocate CPU time such that higher-priority tasks (for example, interactive applications like a Web browser) are given preference over low-priority tasks (for example, non-interactive batch processes like program compilation). At the same time, the scheduler must protect against low-priority process starvation. In other words, low-priority processes must be allowed to run eventually, regardless of how many high-priority processes are vying for CPU time. Schedulers also must be crafted carefully, so that processes appear to be running simultaneously without having too large an impact on system throughput.
+
+For interactive processes like GUIs, the ideal scheduler would give each process a very small amount of time on the CPU and rapidly cycle between processes. Because users expect interactive processes to respond to input immediately, the delay between user input and process execution ideally should be imperceptible to humans—somewhere between 50 and 150ms at most.
+
+For non-interactive processes, the situation is reversed. Switching between processes, or context switching, is a relatively expensive operation. Thus, larger slices of time on the processor and fewer context switches can improve system performance and throughput. The scheduling algorithm must strike a balance between all of these competing needs.
+
+Like most modern operating systems, Linux is a multitasking operating system, and therefore, it has a scheduler. The Linux scheduler has evolved over time.
+
+O(1) Scheduler
+The Linux scheduler was overhauled completely with the release of kernel 2.6. This new scheduler is called the O(1) scheduler—O(...) is referred to as “big O notation”. The name was chosen because the scheduler's algorithm required constant time to make a scheduling decision, regardless of the number of tasks. The algorithm used by the O(1) scheduler relies on active and expired arrays of processes to achieve constant scheduling time. Each process is given a fixed time quantum, after which it is preempted and moved to the expired array. Once all the tasks from the active array have exhausted their time quantum and have been moved to the expired array, an array switch takes place. This switch makes the active array the new empty expired array, while the expired array becomes the active array.
+
+The main issue with this algorithm is the complex heuristics used to mark a task as interactive or non-interactive. The algorithm tries to identify interactive processes by analyzing average sleep time (the amount of time the process spends waiting for input). Processes that sleep for long periods of time probably are waiting for user input, so the scheduler assumes they're interactive. The scheduler gives a priority bonus to interactive tasks (for better throughput) while penalizing non-interactive tasks by lowering their priorities. All the calculations to determine the interactivity of tasks are complex and subject to potential miscalculations, causing non-interactive behavior from an interactive process.
+
+As I explain later in this article, CFS is free from any such calculations and just tries to be “fair” to every task running in the system.
+
+Completely Fair Scheduler
+According to Ingo Molnar, the author of the CFS, its core design can be summed up in single sentence: “CFS basically models an 'ideal, precise multitasking CPU' on real hardware.”
+
+Let's try to understand what “ideal, precise, multitasking CPU” means, as the CFS tries to emulate this CPU. An “ideal, precise, multitasking CPU” is a hardware CPU that can run multiple processes at the same time (in parallel), giving each process an equal share of processor power (not time, but power). If a single process is running, it would receive 100% of the processor's power. With two processes, each would have exactly 50% of the physical power (in parallel). Similarly, with four processes running, each would get precisely 25% of physical CPU power in parallel and so on. Therefore, this CPU would be “fair” to all the tasks running in the system (Figure 1).
+
+Obviously, this ideal CPU is nonexistent, but the CFS tries to emulate such a processor in software. On an actual real-world processor, only one task can be allocated to a CPU at a particular time. Therefore, all other tasks wait during this period. So, while the currently running task gets 100% of the CPU power, all other tasks get 0% of the CPU power. This is obviously not fair (Figure 2).
+
+The CFS tries to eliminate this unfairness from the system. The CFS tries to keep track of the fair share of the CPU that would have been available to each process in the system. So, CFS runs a fair clock at a fraction of real CPU clock speed. The fair clock's rate of increase is calculated by dividing the wall time (in nanoseconds) by the total number of processes waiting. The resulting value is the amount of CPU time to which each process is entitled.
+
+As a process waits for the CPU, the scheduler tracks the amount of time it would have used on the ideal processor. This wait time, represented by the per-task wait_runtime variable, is used to rank processes for scheduling and to determine the amount of time the process is allowed to execute before being preempted. The process with the longest wait time (that is, with the gravest need of CPU) is picked by the scheduler and assigned to the CPU. When this process is running, its wait time decreases, while the time of other waiting tasks increases (as they were waiting). This essentially means that after some time, there will be another task with the largest wait time (in gravest need of the CPU), and the currently running task will be preempted. Using this principle, CFS tries to be fair to all tasks and always tries to have a system with zero wait time for each process—each process has an equal share of the CPU (something an “ideal, precise, multitasking CPU” would have done).
+
+Kernel 2.6.23
+In order for the CFS to emulate an “ideal, precise, multitasking CPU” by giving each runnable process an equal slice of execution time, CFS needs to have the following:
+
+A mechanism to calculate what the fair CPU share is per process. This is achieved by using a system-wide runqueue fair_clock variable (cfs_rq->fair_clock). This fair clock runs at a fraction of real time, so that it runs at the ideal pace for a single task when there are N runnable tasks in the system. For example, if you have four runnable tasks, fair_clock increases at one-fourth of the speed of wall time (which means 25% fair CPU power).
+
+A mechanism to keep track of the time for which each process was waiting while the CPU was assigned to the currently running task. This wait time is accumulated in the per-process variable wait_runtime (process->wait_runtime).
+
+Red-Black Tree (RBTree)
+
+A red-black tree is a type of self-balancing binary search tree—a data structure typically used to implement associative arrays. It is complex, but it has good worst-case running time for its operations and is efficient in practice. It can search, insert and delete in O(log n) time, where n is the number of elements in the tree. In red-black trees, the leaf nodes are not relevant and do not contain data. These leaves need not be explicit in computer memory—a null child pointer can encode the fact that this child is a leaf—but it simplifies some algorithms for operating on red-black trees if the leaves really are explicit nodes. To save memory, sometimes a single sentinel node performs the role of all leaf nodes; all references from internal nodes to leaf nodes then point to the sentinel node. (Source: Wikipedia.)
+
+CFS uses the fair clock and wait runtime to keep all the runnable tasks sorted by the rq->fair_clock - p->wait_runtime key in the rbtree (see the Red-Black Tree sidebar). So, the leftmost task in the tree is the one with the “gravest CPU need”, and CFS picks the leftmost task and sticks to it. As the system progresses forward, newly awakened tasks are put into the tree farther and farther to the right—slowly but surely giving every task a chance to become the leftmost task and, thus, get on the CPU within a deterministic amount of time.
+
+Because of this simple design, CFS no longer uses active and expired arrays and dispensed with sophisticated heuristics to mark tasks as interactive versus non-interactive.
+
+CFS implements priorities by using weighted tasks—each task is assigned a weight based on its static priority. So, while running, the task with lower weight (lower-priority) will see time elapse at a faster rate than that of a higher-priority task. This means its wait_runtime will exhaust more quickly than that of a higher-priority task, so lower-priority tasks will get less CPU time compared to higher-priority tasks.
+
+Kernel 2.6.24
+CFS has been modified a bit further in 2.6.24. Although the basic concept of fairness remains, a few implementation details have changed. Now, instead of chasing the global fair clock (rq->fair_clock), tasks chase each other. A clock per task, vruntime, is introduced, and an approximated average is used to initialize this clock for new tasks. Each task tracks its runtime and is queued in the RBTree using this parameter. So, the task that has run least (the one that has the gravest CPU need) is the leftmost node of the RBTree and will be picked up by the scheduler. See Resources for more details about this implementation.
+
+In kernel 2.6.24, another major addition to CFS is group scheduling. Plain CFS tries to be fair to all the tasks running in the system. For example, let's say there is a total of 25 runnable processes in the system. CFS tries to be fair by allocating 4% of the CPU to all of them. However, let's say that out of these 25 processes, 20 belong to user A while 5 belong to user B. User B is at an inherent disadvantage, as A is getting more CPU power than B. Group scheduling tries to eliminate this problem. It first tries to be fair to a group and then to individual tasks within that group. So CFS, with group scheduling enabled, will allocate 50% of the CPU to each user A and B. The allocated 50% share of A will be divided fairly among A's 20 tasks, while the other 50% of the CPU time will be distributed fairly among B's 5 tasks.
+
+Scheduling Classes/Modular Scheduler
+With kernel 2.6.23, the Linux scheduler also has been made modular. Each scheduling policy (SCHED_FIFO, SCHED_RR, SCHED_OTHER and so on) can be implemented independently of the base scheduler code. This modularization is similar to object-oriented class hierarchies (Figure 3).
+
+The core scheduler does not need to be aware of the implementation details of the individual scheduling policies. In kernel 2.6.23, sched.c (the “scheduler” from older kernels) is divided into the following files to make the scheduler modular:
+
+kernel/sched.c: contains the code of a generic scheduler, thereby exposing functions like sched(). The specific scheduling policy is implemented in a different file.
+
+kernel/sched_fair.c: this is the main file that implements the CFS scheduler and provides the SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE scheduling policies.
+
+kernel/sched_rt.c: provides the SCHED_RR and SCHED_FIFO policies used by real-time (RT) threads.
+
+Each of these scheduling policies (fair and RT) registers its function pointers with the core scheduler. The core scheduler calls the appropriate scheduler (fair or RT), based on the scheduling policy of the particular process. As with the O(1) scheduler, real-time processes will have higher priority than normal processes. CFS mainly addresses non-real-time processes, and the RT scheduler remains more or less the same as before (except for a few changes as to how non-active/expired arrays are maintained).
+
+With this new modular scheduler in place, people who want to write new schedulers for a particular policy can do so by simply registering these new policy functions with the core scheduler.
+
+Summary
+The CFS design is quite radical and innovative in its approach. Features like the modular scheduler ease the task of integrating new scheduler types to the core scheduler.
+
+The new Linux scheduler extends scheduling capabilities by introducing scheduling classes and also simplifies debugging by improving schedule statistics. Completely Fair Scheduler (CFS) is getting good reviews when tested for thread-intensive applications including 3D games. CFS handles CPU resource allocation for executing processes, and aims to maximize overall CPU utilization while maximizing interactive performance. CFS considered as the first implementation of a fair queuing process scheduler in a widely used general-purpose operating system.
+
+The Linux 2.6.23 kernel comes with a modular scheduler core and a CFS, which is implemented as a scheduling module. In this article, get acquainted with the major features of the CFS, see how it works, and look ahead to some of the expected changes for the 2.6.24 release.
+
+
+This is the CFS scheduler.
+
+80% of CFS's design can be summed up in a single sentence: CFS basically
+models an "ideal, precise multi-tasking CPU" on real hardware.
+
+"Ideal multi-tasking CPU" is a (non-existent  :-))  CPU that has 100%
+physical power and which can run each task at precise equal speed, in
+parallel, each at 1/nr_running speed. For example: if there are 2 tasks
+running then it runs each at 50% physical power - totally in parallel.
+
+On real hardware, we can run only a single task at once, so while that
+one task runs, the other tasks that are waiting for the CPU are at a
+disadvantage - the current task gets an unfair amount of CPU time. In
+CFS this fairness imbalance is expressed and tracked via the per-task
+p->wait_runtime (nanosec-unit) value. "wait_runtime" is the amount of
+time the task should now run on the CPU for it to become completely fair
+and balanced.
+
+( small detail: on 'ideal' hardware, the p->wait_runtime value would
+  always be zero - no task would ever get 'out of balance' from the
+  'ideal' share of CPU time. )
+
+CFS's task picking logic is based on this p->wait_runtime value and it
+is thus very simple: it always tries to run the task with the largest
+p->wait_runtime value. In other words, CFS tries to run the task with
+the 'gravest need' for more CPU time. So CFS always tries to split up
+CPU time between runnable tasks as close to 'ideal multitasking
+hardware' as possible.
+
+Most of the rest of CFS's design just falls out of this really simple
+concept, with a few add-on embellishments like nice levels,
+multiprocessing and various algorithm variants to recognize sleepers.
+
+In practice it works like this: the system runs a task a bit, and when
+the task schedules (or a scheduler tick happens) the task's CPU usage is
+'accounted for': the (small) time it just spent using the physical CPU
+is deducted from p->wait_runtime. [minus the 'fair share' it would have
+gotten anyway]. Once p->wait_runtime gets low enough so that another
+task becomes the 'leftmost task' of the time-ordered rbtree it maintains
+(plus a small amount of 'granularity' distance relative to the leftmost
+task so that we do not over-schedule tasks and trash the cache) then the
+new leftmost task is picked and the current task is preempted.
+
+The rq->fair_clock value tracks the 'CPU time a runnable task would have
+fairly gotten, had it been runnable during that time'. So by using
+rq->fair_clock values we can accurately timestamp and measure the
+'expected CPU time' a task should have gotten. All runnable tasks are
+sorted in the rbtree by the "rq->fair_clock - p->wait_runtime" key, and
+CFS picks the 'leftmost' task and sticks to it. As the system progresses
+forwards, newly woken tasks are put into the tree more and more to the
+right - slowly but surely giving a chance for every task to become the
+'leftmost task' and thus get on the CPU within a deterministic amount of
+time.
+
+Some implementation details:
+
+ - the introduction of Scheduling Classes: an extensible hierarchy of
+   scheduler modules. These modules encapsulate scheduling policy
+   details and are handled by the scheduler core without the core
+   code assuming about them too much.
+
+ - sched_fair.c implements the 'CFS desktop scheduler': it is a
+   replacement for the vanilla scheduler's SCHED_OTHER interactivity
+   code.
+
+   I'd like to give credit to Con Kolivas for the general approach here:
+   he has proven via RSDL/SD that 'fair scheduling' is possible and that
+   it results in better desktop scheduling. Kudos Con!
+
+   The CFS patch uses a completely different approach and implementation
+   from RSDL/SD. My goal was to make CFS's interactivity quality exceed
+   that of RSDL/SD, which is a high standard to meet :-) Testing
+   feedback is welcome to decide this one way or another. [ and, in any
+   case, all of SD's logic could be added via a kernel/sched_sd.c module
+   as well, if Con is interested in such an approach. ]
+
+   CFS's design is quite radical: it does not use runqueues, it uses a
+   time-ordered rbtree to build a 'timeline' of future task execution,
+   and thus has no 'array switch' artifacts (by which both the vanilla
+   scheduler and RSDL/SD are affected).
+
+   CFS uses nanosecond granularity accounting and does not rely on any
+   jiffies or other HZ detail. Thus the CFS scheduler has no notion of
+   'timeslices' and has no heuristics whatsoever. There is only one
+   central tunable:
+
+         /proc/sys/kernel/sched_granularity_ns
+
+   which can be used to tune the scheduler from 'desktop' (low
+   latencies) to 'server' (good batching) workloads. It defaults to a
+   setting suitable for desktop workloads. SCHED_BATCH is handled by the
+   CFS scheduler module too.
+
+   Due to its design, the CFS scheduler is not prone to any of the
+   'attacks' that exist today against the heuristics of the stock
+   scheduler: fiftyp.c, thud.c, chew.c, ring-test.c, massive_intr.c all
+   work fine and do not impact interactivity and produce the expected
+   behavior.
+
+   the CFS scheduler has a much stronger handling of nice levels and
+   SCHED_BATCH: both types of workloads should be isolated much more
+   agressively than under the vanilla scheduler.
+
+   ( another detail: due to nanosec accounting and timeline sorting,
+     sched_yield() support is very simple under CFS, and in fact under
+     CFS sched_yield() behaves much better than under any other
+     scheduler i have tested so far. )
+
+ - sched_rt.c implements SCHED_FIFO and SCHED_RR semantics, in a simpler
+   way than the vanilla scheduler does. It uses 100 runqueues (for all
+   100 RT priority levels, instead of 140 in the vanilla scheduler)
+   and it needs no expired array.
+
+ - reworked/sanitized SMP load-balancing: the runqueue-walking
+   assumptions are gone from the load-balancing code now, and
+   iterators of the scheduling modules are used. The balancing code got
+   quite a bit simpler as a result.
+
+
+This is the CFS scheduler.
+
+80% of CFS's design can be summed up in a single sentence: CFS basically
+models an "ideal, precise multi-tasking CPU" on real hardware.
+
+"Ideal multi-tasking CPU" is a (non-existent  :-))  CPU that has 100%
+physical power and which can run each task at precise equal speed, in
+parallel, each at 1/nr_running speed. For example: if there are 2 tasks
+running then it runs each at 50% physical power - totally in parallel.
+
+On real hardware, we can run only a single task at once, so while that
+one task runs, the other tasks that are waiting for the CPU are at a
+disadvantage - the current task gets an unfair amount of CPU time. In
+CFS this fairness imbalance is expressed and tracked via the per-task
+p->wait_runtime (nanosec-unit) value. "wait_runtime" is the amount of
+time the task should now run on the CPU for it to become completely fair
+and balanced.
+
+( small detail: on 'ideal' hardware, the p->wait_runtime value would
+  always be zero - no task would ever get 'out of balance' from the
+  'ideal' share of CPU time. )
+
+CFS's task picking logic is based on this p->wait_runtime value and it
+is thus very simple: it always tries to run the task with the largest
+p->wait_runtime value. In other words, CFS tries to run the task with
+the 'gravest need' for more CPU time. So CFS always tries to split up
+CPU time between runnable tasks as close to 'ideal multitasking
+hardware' as possible.
+
+Most of the rest of CFS's design just falls out of this really simple
+concept, with a few add-on embellishments like nice levels,
+multiprocessing and various algorithm variants to recognize sleepers.
+
+In practice it works like this: the system runs a task a bit, and when
+the task schedules (or a scheduler tick happens) the task's CPU usage is
+'accounted for': the (small) time it just spent using the physical CPU
+is deducted from p->wait_runtime. [minus the 'fair share' it would have
+gotten anyway]. Once p->wait_runtime gets low enough so that another
+task becomes the 'leftmost task' of the time-ordered rbtree it maintains
+(plus a small amount of 'granularity' distance relative to the leftmost
+task so that we do not over-schedule tasks and trash the cache) then the
+new leftmost task is picked and the current task is preempted.
+
+The rq->fair_clock value tracks the 'CPU time a runnable task would have
+fairly gotten, had it been runnable during that time'. So by using
+rq->fair_clock values we can accurately timestamp and measure the
+'expected CPU time' a task should have gotten. All runnable tasks are
+sorted in the rbtree by the "rq->fair_clock - p->wait_runtime" key, and
+CFS picks the 'leftmost' task and sticks to it. As the system progresses
+forwards, newly woken tasks are put into the tree more and more to the
+right - slowly but surely giving a chance for every task to become the
+'leftmost task' and thus get on the CPU within a deterministic amount of
+time.
+
+Some implementation details:
+
+ - the introduction of Scheduling Classes: an extensible hierarchy of
+   scheduler modules. These modules encapsulate scheduling policy
+   details and are handled by the scheduler core without the core
+   code assuming about them too much.
+
+ - sched_fair.c implements the 'CFS desktop scheduler': it is a
+   replacement for the vanilla scheduler's SCHED_OTHER interactivity
+   code.
+
+   I'd like to give credit to Con Kolivas for the general approach here:
+   he has proven via RSDL/SD that 'fair scheduling' is possible and that
+   it results in better desktop scheduling. Kudos Con!
+
+   The CFS patch uses a completely different approach and implementation
+   from RSDL/SD. My goal was to make CFS's interactivity quality exceed
+   that of RSDL/SD, which is a high standard to meet :-) Testing
+   feedback is welcome to decide this one way or another. [ and, in any
+   case, all of SD's logic could be added via a kernel/sched_sd.c module
+   as well, if Con is interested in such an approach. ]
+
+   CFS's design is quite radical: it does not use runqueues, it uses a
+   time-ordered rbtree to build a 'timeline' of future task execution,
+   and thus has no 'array switch' artifacts (by which both the vanilla
+   scheduler and RSDL/SD are affected).
+
+   CFS uses nanosecond granularity accounting and does not rely on any
+   jiffies or other HZ detail. Thus the CFS scheduler has no notion of
+   'timeslices' and has no heuristics whatsoever. There is only one
+   central tunable:
+
+         /proc/sys/kernel/sched_granularity_ns
+
+   which can be used to tune the scheduler from 'desktop' (low
+   latencies) to 'server' (good batching) workloads. It defaults to a
+   setting suitable for desktop workloads. SCHED_BATCH is handled by the
+   CFS scheduler module too.
+
+   Due to its design, the CFS scheduler is not prone to any of the
+   'attacks' that exist today against the heuristics of the stock
+   scheduler: fiftyp.c, thud.c, chew.c, ring-test.c, massive_intr.c all
+   work fine and do not impact interactivity and produce the expected
+   behavior.
+
+   the CFS scheduler has a much stronger handling of nice levels and
+   SCHED_BATCH: both types of workloads should be isolated much more
+   agressively than under the vanilla scheduler.
+
+   ( another detail: due to nanosec accounting and timeline sorting,
+     sched_yield() support is very simple under CFS, and in fact under
+     CFS sched_yield() behaves much better than under any other
+     scheduler i have tested so far. )
+
+ - sched_rt.c implements SCHED_FIFO and SCHED_RR semantics, in a simpler
+   way than the vanilla scheduler does. It uses 100 runqueues (for all
+   100 RT priority levels, instead of 140 in the vanilla scheduler)
+   and it needs no expired array.
+
+ - reworked/sanitized SMP load-balancing: the runqueue-walking
+   assumptions are gone from the load-balancing code now, and
+   iterators of the scheduling modules are used. The balancing code got
+   quite a bit simpler as a result.
+
